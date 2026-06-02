@@ -806,35 +806,75 @@ _runtime: Optional[Runtime] = None
 _cfg: Optional[Config] = None
 
 
+def _env_metadata_payload() -> dict:
+    """Build metadata payload from env vars — works even before _runtime is ready."""
+    resource_uri = os.environ.get("AUTHSEC_RESOURCE_URI", _RESOURCE_URI)
+    auth_server = (
+        os.environ.get("AUTHSEC_AUTHORIZATION_SERVER")
+        or os.environ.get("AUTHSEC_ISSUER")
+        or _AUTHSEC_ISSUER
+    )
+    resource_name = os.environ.get("AUTHSEC_RESOURCE_NAME", _RESOURCE_NAME)
+    return {
+        "resource": resource_uri,
+        "authorization_servers": [auth_server],
+        "resource_name": resource_name,
+        "scopes_supported": _CANONICAL_SCOPES,
+        "bearer_methods_supported": ["header"],
+    }
+
+
 async def _authsec_metadata(request: Request) -> Response:
-    """GET /.well-known/oauth-protected-resource/mcp — RFC 9728 metadata."""
-    if _runtime is None:
-        return JSONResponse({"error": "service_unavailable"}, status_code=503)
-    authoritative = await _runtime.get_authoritative_scopes()
-    body, resp_headers = metadata_json_response(_runtime.cfg, authoritative)
-    return Response(content=body, media_type="application/json", headers=resp_headers)
+    """GET /.well-known/oauth-protected-resource/mcp — RFC 9728 metadata.
+
+    Returns the metadata document using the live scope list from AuthSec when
+    the runtime is ready, or falls back to the configured canonical scopes.
+    Always returns 200 — this endpoint must never return 4xx/5xx because it
+    is the OAuth discovery entry point for MCP clients.
+    """
+    if _runtime is not None:
+        try:
+            authoritative = await _runtime.get_authoritative_scopes()
+            body, resp_headers = metadata_json_response(_runtime.cfg, authoritative)
+            return Response(content=body, media_type="application/json", headers=resp_headers)
+        except Exception:
+            _LOG.exception("metadata: runtime error, falling back to env config")
+    return JSONResponse(
+        _env_metadata_payload(),
+        headers={"Cache-Control": "public, max-age=60"},
+    )
 
 
 async def _authsec_mcp(request: Request) -> Response:
     """POST /mcp — bearer-token validation + scope enforcement, then dispatch."""
-    if _runtime is None:
-        return JSONResponse({"error": "service_unavailable"}, status_code=503)
-
-    cfg = _runtime.cfg
-
     # ── 1. Extract bearer token ───────────────────────────────────────────
     auth_header = request.headers.get("authorization", "")
     parts = auth_header.split(None, 1)
     token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" else ""
 
     if not token:
-        www = build_www_authenticate(cfg, error="invalid_token",
-                                     error_description="missing bearer token")
+        # Build 401 from env vars — works even if _runtime failed to initialise.
+        resource_uri = os.environ.get("AUTHSEC_RESOURCE_URI", _RESOURCE_URI)
+        resource_name = os.environ.get("AUTHSEC_RESOURCE_NAME", _RESOURCE_NAME)
+        from authsec_sdk.runtime.metadata import build_resource_metadata_url
+        metadata_url = build_resource_metadata_url(resource_uri)
+        realm = resource_name or "AuthSec Protected Resource"
+        www = (
+            f'Bearer realm="{realm}"'
+            f', resource_metadata="{metadata_url}"'
+            f', error="invalid_token"'
+            f', error_description="missing bearer token"'
+        )
         return JSONResponse(
             {"error": "invalid_token", "error_description": "missing bearer token"},
             status_code=401,
             headers={"WWW-Authenticate": www},
         )
+
+    if _runtime is None:
+        return JSONResponse({"error": "service_unavailable"}, status_code=503)
+
+    cfg = _runtime.cfg
 
     # ── 2. Validate token ─────────────────────────────────────────────────
     try:
