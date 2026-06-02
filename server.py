@@ -28,17 +28,25 @@ from dotenv import load_dotenv
 from typing import Any, Optional
 
 import httpx
+from contextlib import asynccontextmanager
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
-from authsec_sdk import ManifestTool, from_env, mount_mcp
+from authsec_sdk import ManifestTool, from_env
 from authsec_sdk.runtime import Config, PolicyMode, ValidationMode
 from authsec_sdk.runtime.server import (
     InsufficientScopeError,
     PolicyUnavailableError,
     Runtime,
 )
+from authsec_sdk.runtime.metadata import (
+    build_resource_metadata_path,
+    metadata_json_response,
+    build_www_authenticate,
+)
+from authsec_sdk.runtime.validator import TokenInvalidError, TokenInactiveError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -617,13 +625,6 @@ def _rpc_err(req_id: Any, code: int, message: str, data: Any = None) -> dict[str
 
 
 # ---------------------------------------------------------------------------
-# Runtime reference (populated at module load after mount_mcp)
-# ---------------------------------------------------------------------------
-
-_runtime: Optional[Runtime] = None
-
-
-# ---------------------------------------------------------------------------
 # In-process RPC handler — used by the AuthSec manifest publisher only.
 # No bearer auth is applied here; this path never reaches external clients.
 # ---------------------------------------------------------------------------
@@ -797,6 +798,114 @@ def _build_config() -> Config:
 
 
 # ---------------------------------------------------------------------------
+# AuthSec route handlers — defined before app construction so routes can be
+# passed to Starlette() directly instead of appended after construction.
+# ---------------------------------------------------------------------------
+
+_runtime: Optional[Runtime] = None
+_cfg: Optional[Config] = None
+
+
+async def _authsec_metadata(request: Request) -> Response:
+    """GET /.well-known/oauth-protected-resource/mcp — RFC 9728 metadata."""
+    if _runtime is None:
+        return JSONResponse({"error": "service_unavailable"}, status_code=503)
+    authoritative = await _runtime.get_authoritative_scopes()
+    body, resp_headers = metadata_json_response(_runtime.cfg, authoritative)
+    return Response(content=body, media_type="application/json", headers=resp_headers)
+
+
+async def _authsec_mcp(request: Request) -> Response:
+    """POST /mcp — bearer-token validation + scope enforcement, then dispatch."""
+    if _runtime is None:
+        return JSONResponse({"error": "service_unavailable"}, status_code=503)
+
+    cfg = _runtime.cfg
+
+    # ── 1. Extract bearer token ───────────────────────────────────────────
+    auth_header = request.headers.get("authorization", "")
+    parts = auth_header.split(None, 1)
+    token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" else ""
+
+    if not token:
+        www = build_www_authenticate(cfg, error="invalid_token",
+                                     error_description="missing bearer token")
+        return JSONResponse(
+            {"error": "invalid_token", "error_description": "missing bearer token"},
+            status_code=401,
+            headers={"WWW-Authenticate": www},
+        )
+
+    # ── 2. Validate token ─────────────────────────────────────────────────
+    try:
+        principal = await _runtime.validate_token(token)
+    except (TokenInvalidError, TokenInactiveError) as exc:
+        www = build_www_authenticate(cfg, error="invalid_token",
+                                     error_description=str(exc))
+        return JSONResponse(
+            {"error": "invalid_token", "error_description": str(exc)},
+            status_code=401,
+            headers={"WWW-Authenticate": www},
+        )
+    except Exception:
+        _LOG.exception("unexpected token validation failure")
+        www = build_www_authenticate(cfg, error="invalid_token",
+                                     error_description="token validation failure")
+        return JSONResponse(
+            {"error": "invalid_token", "error_description": "token validation failure"},
+            status_code=401,
+            headers={"WWW-Authenticate": www},
+        )
+
+    request.state.authsec_principal = principal
+
+    # ── 3. tools/call scope enforcement ───────────────────────────────────
+    body_bytes = await request.body()
+    if body_bytes and request.method == "POST":
+        try:
+            payload = json.loads(body_bytes)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and payload.get("method") == "tools/call":
+            tool_name = (payload.get("params") or {}).get("name", "")
+            if tool_name:
+                try:
+                    await _runtime.authorize_tool(principal, tool_name)
+                except InsufficientScopeError as exc:
+                    scope = " ".join(exc.required)
+                    www = build_www_authenticate(cfg, error="insufficient_scope",
+                                                 error_description=f"tool {exc.tool!r} requires {exc.required!r}",
+                                                 scope=scope)
+                    return JSONResponse(
+                        {"error": "insufficient_scope",
+                         "error_description": str(exc),
+                         "tool": exc.tool,
+                         "required_scopes": exc.required},
+                        status_code=403,
+                        headers={"WWW-Authenticate": www},
+                    )
+                except PolicyUnavailableError as exc:
+                    return JSONResponse(
+                        {"error": "policy_unavailable",
+                         "error_description": str(exc)},
+                        status_code=503,
+                    )
+
+    # ── 4. Replay consumed body and dispatch to MCP handler ───────────────
+    sent = False
+
+    async def _replay():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    request._receive = _replay  # type: ignore[attr-defined]
+    return await mcp_handler(request)
+
+
+# ---------------------------------------------------------------------------
 # Application setup
 # ---------------------------------------------------------------------------
 
@@ -804,67 +913,44 @@ _AUTHSEC_ENABLED = os.environ.get("AUTHSEC_ENABLED", "true").lower() not in ("fa
 
 
 async def _startup() -> None:
-    """Fetch the initial scope matrix and publish the manifest to AuthSec.
-
-    Starlette 1.x removed on_event() so the SDK's startup hook (which checks
-    hasattr(app, 'on_event')) never fires. We call rt.startup() from the
-    lifespan instead.
-
-    This runs as a background task so the server becomes ready immediately and
-    can serve the metadata endpoint and 401 challenges while the scope matrix
-    fetch / manifest publish are in flight.  rt.startup() is safe to fire
-    concurrently with request handling — it only populates a cache.
-    """
     if _runtime is not None:
         await _runtime.startup(rpc_handler=_manifest_rpc_handler)
 
 
-from contextlib import asynccontextmanager
-
-
 @asynccontextmanager
 async def _lifespan(app):
-    # Fire startup tasks in the background so the server becomes ready
-    # immediately instead of blocking until AuthSec responds (up to 10 s).
     asyncio.create_task(_startup())
     yield
 
 
-app = Starlette(lifespan=_lifespan)
-
+# Build route list before constructing Starlette so routes are registered
+# at construction time — not appended after, which can be unreliable.
 if _AUTHSEC_ENABLED:
     try:
         _cfg = _build_config()
-        # mount_mcp registers:
-        #   POST /mcp                                           — bearer-protected handler
-        #   GET  /.well-known/oauth-protected-resource/mcp     — RFC 9728 PRM
-        _runtime = mount_mcp(
-            app,
-            "/mcp",
-            mcp_handler,
-            _cfg,
-            rpc_handler=_manifest_rpc_handler,
-        )
+        _runtime = Runtime(_cfg)
+        _meta_path = build_resource_metadata_path(_cfg.resource_uri)
+        _routes = [
+            Route(_meta_path, _authsec_metadata, methods=["GET"]),
+            Route("/mcp", _authsec_mcp, methods=["GET", "POST"]),
+        ]
         _LOG.info(
-            "AuthSec protection active — resource_uri=%s policy_mode=%s",
+            "AuthSec protection active — resource_uri=%s policy_mode=%s metadata_path=%s",
             _cfg.resource_uri,
             _cfg.effective_policy_mode().value,
+            _meta_path,
         )
     except Exception as exc:
         _LOG.error(
-            "AuthSec initialization failed (%s: %s) — check AUTHSEC_* environment "
-            "variables. Server will start but ALL requests will be rejected.",
-            type(exc).__name__,
-            exc,
+            "AuthSec initialization failed (%s: %s) — check AUTHSEC_* env vars.",
+            type(exc).__name__, exc,
         )
+        _routes = [Route("/mcp", mcp_handler, methods=["GET", "POST"])]
 else:
-    # Development / smoke-test mode — no bearer token required.
-    _LOG.warning(
-        "AUTHSEC_ENABLED=false — running WITHOUT token validation. "
-        "DO NOT expose this configuration in production."
-    )
-    from starlette.routing import Route
-    app.routes.append(Route("/mcp", mcp_handler, methods=["GET", "POST"]))
+    _LOG.warning("AUTHSEC_ENABLED=false — running WITHOUT token validation.")
+    _routes = [Route("/mcp", mcp_handler, methods=["GET", "POST"])]
+
+app = Starlette(routes=_routes, lifespan=_lifespan)
 
 
 # ---------------------------------------------------------------------------
