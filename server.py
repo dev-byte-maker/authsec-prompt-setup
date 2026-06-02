@@ -321,7 +321,9 @@ async def _run_startup() -> None:
     try:
         if _runtime is not None:
             await _runtime.startup()
-    except Exception as exc:
+    except BaseException as exc:
+        # Catch BaseException (not just Exception) so asyncio.CancelledError
+        # on uvicorn shutdown doesn't propagate and destabilise the event loop.
         logger.error("AuthSec startup task failed (non-fatal): %s", exc)
 
 
