@@ -19,6 +19,7 @@ to callers or reflected in AuthSec tokens.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -803,12 +804,16 @@ _AUTHSEC_ENABLED = os.environ.get("AUTHSEC_ENABLED", "true").lower() not in ("fa
 
 
 async def _startup() -> None:
-    """Called once at ASGI lifespan startup.
+    """Fetch the initial scope matrix and publish the manifest to AuthSec.
 
-    Starlette 1.x removed on_event() in favour of the lifespan parameter, so
-    the SDK's hook (which checks hasattr(app, 'on_event')) never fires. We wire
-    rt.startup() here instead so the scope matrix is fetched and the manifest is
-    published to AuthSec on every cold start.
+    Starlette 1.x removed on_event() so the SDK's startup hook (which checks
+    hasattr(app, 'on_event')) never fires. We call rt.startup() from the
+    lifespan instead.
+
+    This runs as a background task so the server becomes ready immediately and
+    can serve the metadata endpoint and 401 challenges while the scope matrix
+    fetch / manifest publish are in flight.  rt.startup() is safe to fire
+    concurrently with request handling — it only populates a cache.
     """
     if _runtime is not None:
         await _runtime.startup(rpc_handler=_manifest_rpc_handler)
@@ -819,7 +824,9 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app):
-    await _startup()
+    # Fire startup tasks in the background so the server becomes ready
+    # immediately instead of blocking until AuthSec responds (up to 10 s).
+    asyncio.create_task(_startup())
     yield
 
 
