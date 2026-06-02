@@ -1,48 +1,7 @@
-## OS files
-.DS_Store
-Thumbs.db
-Desktop.ini
-
-## Editor / IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-## Logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-## Environment files
 .env
-.env.*
-!.env.example
-
-## Dependencies
-node_modules/
-vendor/
-
-## Build outputs
-dist/
-build/
-out/
-coverage/
-.next/
-.nuxt/
-.cache/
-
-## Python
+.venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
+dist/
 .pytest_cache/
-.mypy_cache/
-.venv/
-venv/
-env/
-
-## Misc
-*.tmp
