@@ -923,32 +923,48 @@ async def _lifespan(app):
     yield
 
 
-# Build route list before constructing Starlette so routes are registered
-# at construction time — not appended after, which can be unreliable.
+async def _health(request: Request) -> Response:
+    """Railway healthcheck — always 200 so the service is never marked unhealthy."""
+    return JSONResponse({"status": "ok"})
+
+
+# Compute the metadata path now (before app construction) using the env var
+# that was loaded by load_dotenv() above.
+_meta_path = build_resource_metadata_path(
+    os.environ.get("AUTHSEC_RESOURCE_URI", _RESOURCE_URI)
+)
+
+# Build route list at construction time — never append routes after Starlette()
+# is created, as that is unreliable in some ASGI deployment environments.
 if _AUTHSEC_ENABLED:
     try:
         _cfg = _build_config()
         _runtime = Runtime(_cfg)
         _meta_path = build_resource_metadata_path(_cfg.resource_uri)
-        _routes = [
-            Route(_meta_path, _authsec_metadata, methods=["GET"]),
-            Route("/mcp", _authsec_mcp, methods=["GET", "POST"]),
-        ]
         _LOG.info(
-            "AuthSec protection active — resource_uri=%s policy_mode=%s metadata_path=%s",
+            "AuthSec protection active — resource_uri=%s policy_mode=%s",
             _cfg.resource_uri,
             _cfg.effective_policy_mode().value,
-            _meta_path,
         )
     except Exception as exc:
         _LOG.error(
-            "AuthSec initialization failed (%s: %s) — check AUTHSEC_* env vars.",
+            "AuthSec initialization failed (%s: %s) — check AUTHSEC_* env vars. "
+            "Metadata endpoint will return 503 until credentials are configured.",
             type(exc).__name__, exc,
         )
-        _routes = [Route("/mcp", mcp_handler, methods=["GET", "POST"])]
+
+    _routes = [
+        Route("/health", _health, methods=["GET"]),
+        Route(_meta_path, _authsec_metadata, methods=["GET"]),
+        Route("/mcp", _authsec_mcp if _runtime is not None else mcp_handler,
+              methods=["GET", "POST"]),
+    ]
 else:
     _LOG.warning("AUTHSEC_ENABLED=false — running WITHOUT token validation.")
-    _routes = [Route("/mcp", mcp_handler, methods=["GET", "POST"])]
+    _routes = [
+        Route("/health", _health, methods=["GET"]),
+        Route("/mcp", mcp_handler, methods=["GET", "POST"]),
+    ]
 
 app = Starlette(routes=_routes, lifespan=_lifespan)
 
