@@ -315,13 +315,21 @@ def _tool_inventory() -> list[ManifestTool]:
 _runtime: Optional[Runtime] = None
 
 
+async def _run_startup() -> None:
+    """Background task: fetch scope matrix + publish manifest after server is ready."""
+    try:
+        if _runtime is not None:
+            await _runtime.startup()
+    except Exception as exc:
+        logger.error("AuthSec startup task failed (non-fatal): %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(starlette_app: Starlette):
-    # Starlette 1.x dropped on_event; call rt.startup() here instead.
-    # mount_mcp's startup fetches the initial scope matrix and publishes the
-    # tool manifest to AuthSec so admins can bind scopes in the UI.
-    if _runtime is not None:
-        await _runtime.startup()
+    # Fire startup as a background task so uvicorn sends lifespan.startup.complete
+    # immediately and Railway's health check can reach /health right away.
+    # Blocking here causes a 502 window while the scope-matrix fetch is in-flight.
+    asyncio.create_task(_run_startup())
     yield
 
 
