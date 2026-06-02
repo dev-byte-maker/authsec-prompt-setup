@@ -23,6 +23,7 @@ import base64
 import json
 import logging
 import os
+from dotenv import load_dotenv
 from typing import Any, Optional
 
 import httpx
@@ -43,6 +44,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 _LOG = logging.getLogger("mcp.server")
+
+# Load environment variables from a .env file when present (development convenience)
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Tool registry
