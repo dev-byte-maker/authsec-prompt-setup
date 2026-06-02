@@ -763,11 +763,20 @@ def _build_config() -> Config:
     cfg.tool_scopes = LOCAL_TOOL_SCOPES
     cfg.tool_scope_suggestions = TOOL_SCOPE_SUGGESTIONS
 
-    # Use remote scope matrix with local-scopes fallback when unreachable.
-    # Degrade gracefully to local-only if no resource_server_id is configured.
+    # Always use REMOTE_WITH_LOCAL_FALLBACK when a resource_server_id is configured.
+    #
+    # REMOTE_REQUIRED blocks ALL tool calls (raises PolicyUnavailableError) while
+    # the remote scope matrix has not yet reached policy_complete=true — i.e. during
+    # the bootstrap phase before the admin has mapped tools to scopes in the AuthSec
+    # dashboard. This makes tools/list return [] and breaks the "Discovery snapshot"
+    # and "tools/list filter" validations.
+    #
+    # REMOTE_WITH_LOCAL_FALLBACK lets the server serve tools via the local scope map
+    # (LOCAL_TOOL_SCOPES) while the remote matrix is being configured. Once the admin
+    # activates the resource server in AuthSec, the SDK picks up the remote policy on
+    # the next TTL refresh (≤30 s) and local scopes become the fallback-only path.
     if cfg.resource_server_id:
-        if cfg.policy_mode == PolicyMode.UNSET:
-            cfg.policy_mode = PolicyMode.REMOTE_WITH_LOCAL_FALLBACK
+        cfg.policy_mode = PolicyMode.REMOTE_WITH_LOCAL_FALLBACK
     else:
         _LOG.warning(
             "AUTHSEC_RESOURCE_SERVER_ID not set — scope matrix unavailable; "
@@ -792,26 +801,55 @@ def _build_config() -> Config:
 
 _AUTHSEC_ENABLED = os.environ.get("AUTHSEC_ENABLED", "true").lower() not in ("false", "0", "no")
 
-app = Starlette()
+
+async def _startup() -> None:
+    """Called once at ASGI lifespan startup.
+
+    Starlette 1.x removed on_event() in favour of the lifespan parameter, so
+    the SDK's hook (which checks hasattr(app, 'on_event')) never fires. We wire
+    rt.startup() here instead so the scope matrix is fetched and the manifest is
+    published to AuthSec on every cold start.
+    """
+    if _runtime is not None:
+        await _runtime.startup(rpc_handler=_manifest_rpc_handler)
+
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _lifespan(app):
+    await _startup()
+    yield
+
+
+app = Starlette(lifespan=_lifespan)
 
 if _AUTHSEC_ENABLED:
-    _cfg = _build_config()
-    # mount_mcp registers:
-    #   POST /mcp                                             — bearer-protected handler
-    #   GET  /.well-known/oauth-protected-resource/mcp       — RFC 9728 PRM
-    # It also hooks startup to fetch the initial scope matrix and publish the manifest.
-    _runtime = mount_mcp(
-        app,
-        "/mcp",
-        mcp_handler,
-        _cfg,
-        rpc_handler=_manifest_rpc_handler,
-    )
-    _LOG.info(
-        "AuthSec protection active — resource_uri=%s policy_mode=%s",
-        _cfg.resource_uri,
-        _cfg.effective_policy_mode().value,
-    )
+    try:
+        _cfg = _build_config()
+        # mount_mcp registers:
+        #   POST /mcp                                           — bearer-protected handler
+        #   GET  /.well-known/oauth-protected-resource/mcp     — RFC 9728 PRM
+        _runtime = mount_mcp(
+            app,
+            "/mcp",
+            mcp_handler,
+            _cfg,
+            rpc_handler=_manifest_rpc_handler,
+        )
+        _LOG.info(
+            "AuthSec protection active — resource_uri=%s policy_mode=%s",
+            _cfg.resource_uri,
+            _cfg.effective_policy_mode().value,
+        )
+    except Exception as exc:
+        _LOG.error(
+            "AuthSec initialization failed (%s: %s) — check AUTHSEC_* environment "
+            "variables. Server will start but ALL requests will be rejected.",
+            type(exc).__name__,
+            exc,
+        )
 else:
     # Development / smoke-test mode — no bearer token required.
     _LOG.warning(
